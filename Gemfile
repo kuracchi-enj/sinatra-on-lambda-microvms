@@ -6,5 +6,6 @@ gem "sinatra", "~> 4.1"
 
 group :test do
   gem "minitest", "~> 5.25"
+  gem "rake", "~> 13.2"
   gem "rack-test", "~> 2.2"
 end
