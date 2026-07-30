@@ -337,18 +337,135 @@ metrics:
 alarm は provision/resume failure rate、hard expiry 接近、orphan 増加、401/403 spike、checkpoint age、
 route と control-plane state の不一致に設定する。
 
-## 13. Validation plan and acceptance criteria
+## 13. AWS CDK deployment specification
+
+### 13.1 基本方針
+
+* AWS CDK v2 の TypeScript application を採用する。
+* `cdk synth` が生成する CloudFormation template を全環境の source of truth とする。
+* console/CLI による恒久リソース変更は禁止し、緊急変更も CDK code へ戻す。
+* account/region ごとに `cdk bootstrap` し、開発・staging・production を別 stack とする。
+* environment 固有値は CDK context に秘密を置かず、型付き stage properties、SSM parameter、
+  Secrets Manager reference で注入する。
+* construct ID、table 名等には stage を含めるが、置換不能な resource の物理名 hard-code は避ける。
+
+CDK app の候補構造:
+
+```text
+infra/
+├── bin/app.ts
+├── lib/config.ts
+├── lib/foundation-stack.ts
+├── lib/control-plane-stack.ts
+├── lib/microvm-image-stack.ts
+├── lib/observability-stack.ts
+├── lib/constructs/microvm-image.ts
+├── test/*.test.ts
+├── cdk.json
+├── package.json
+└── tsconfig.json
+```
+
+### 13.2 stack boundary
+
+| Stack | CDK managed resources | Lifecycle |
+| --- | --- | --- |
+| `FoundationStack` | VPC/subnets、security groups、KMS、artifact bucket、routing table | 長期、retain 優先 |
+| `ControlPlaneStack` | public API/proxy、WAF、reconciler、IAM、event launcher | application release 単位 |
+| `MicrovmImageStack` | source asset、build role/pipeline、image definition/version output | immutable 世代単位 |
+| `ObservabilityStack` | log groups、dashboards、alarms、notification topic | 長期 |
+
+stack 間は巨大な cross-stack reference を避け、安定した ARN/ID のみ SSM parameter または明示的
+properties で渡す。production の DynamoDB、KMS、artifact bucket、log group は `RETAIN` と deletion
+protection を設定する。ephemeral preview stage のみ `DESTROY` を許可する。
+
+### 13.3 MicroVM resource coverage
+
+実装時点の対応状況を次の順で検出する。
+
+1. AWS CDK に正式な L2 construct があれば採用する。
+2. CloudFormation type に対応する L1 `Cfn*` があれば採用する。
+3. L1 未生成で正式な CloudFormation type があれば `CfnResource` を使用する。
+4. CloudFormation 未対応の永続 resource だけを CDK custom resource provider で補う。
+
+custom resource は `AwsCustomResource` に任意の SDK call 名を推測して埋め込まない。正式な SDK
+service model が提供されるまでは synth を失敗させる。専用 provider は以下を満たすこと。
+
+* create/update/delete が同一入力に対して冪等である。
+* AWS resource ID を CloudFormation physical resource ID にする。
+* 非同期 image build は `onEvent` + `isComplete`、または Step Functions/CodeBuild へ委譲する。
+* failure reason を secret/token 抜きで CloudFormation event に返す。
+* update は immutable image の新世代を作り、稼働世代の即時破棄をしない。
+* delete/rollback は routing 中の image を保護し、reconciler に安全な cleanup を要求する。
+
+`RunMicrovm`、suspend/resume、JWE token 発行は request/tenant ごとの実行時処理であり、CDK custom
+resource にしてはならない。これらは ControlPlaneStack が配備する proxy/reconciler が担当する。
+
+### 13.4 application image delivery
+
+1. CI が Gemfile.lock の `aarch64-linux`、unit test、dependency scan を検証する。
+2. CDK asset または dedicated artifact bucket に source bundle を content hash 付きで upload する。
+3. image builder は digest で固定した base image から arm64 image を作る。
+4. asynchronous build 完了と validation hook 成功を待ち、image ID/version/digest を出力する。
+5. staging smoke test 後、production context には検証済み immutable image version だけを渡す。
+6. reconciler が tenant を段階的に新 generation へ移し、旧 image は rollback window 後に削除する。
+
+CDK deploy 自体は tenant VM を起動しない。infra deployment と runtime rollout を分離することで、
+CloudFormation rollback と最大 8 時間の VM lifecycle を結合させない。
+
+### 13.5 IAM and secrets
+
+* CDK deploy role、CloudFormation execution role、image build role、proxy runtime role、reconciler
+  role、custom resource provider role を分離する。
+* provider role は必要な MicroVM image API と対象 ARN に絞り、`RunMicrovm` や token 発行権限を
+  image provider に付与しない。
+* proxy の token 発行権限、reconciler の lifecycle 操作権限も別 policy statement にする。
+* CDK code/template/output に JWE、DB password、secret value を含めない。
+* IAM wildcard が必要な未対応 API は理由を記録し、service が resource-level permission に対応後
+  tightening test で除去する。
+
+### 13.6 pipeline and commands
+
+pull request では少なくとも以下を実行する。
+
+```bash
+npm ci --prefix infra
+npm test --prefix infra
+npm run lint --prefix infra
+npm --prefix infra exec cdk -- synth
+npm --prefix infra exec cdk -- diff --context stage=dev
+```
+
+merge 後は `dev deploy -> MicroVM smoke test -> staging deploy/test -> manual approval -> production`
+の順に進める。production では `cdk diff` artifact と security review 結果を承認対象にする。
+`cdk deploy --all --require-approval never` を開発者端末から production へ直接実行しない。
+
+### 13.7 CDK tests
+
+CDK assertion tests で次を固定する。
+
+* routing table の PITR、encryption、production removal policy。
+* bucket の block-public-access、encryption、TLS-only policy。
+* proxy/provider role に admin policy と不必要な wildcard がないこと。
+* log retention、alarm、DLQ、reserved concurrency が設定されること。
+* production resource に `DeletionPolicy: Retain` が出力されること。
+* image version変更時に durable data resource が置換されないこと。
+* custom resource provider の timeout、retry、DLQ と `isComplete` polling が bounded であること。
+
+## 14. Validation plan and acceptance criteria
 
 ### Gate 0: service discovery
 
 * 東京リージョンで service/API/ARN/quotas/pricing を一次資料と CLI で確認する。
 * hook/token schema を保存し、この文書の provisional 表記を解消する。
+* CloudFormation resource type、CDK L1/L2、SDK service model の対応範囲を記録する。
 
 ### Gate 1: image
 
 * `linux/arm64` image が build され、x86_64-only dependency がない。
 * non-root Puma が port 8080 で起動し、local container test が通る。
 * image layer、environment、SBOM に secret がない。
+* CDK image resource/provider が create、no-op update、replacement、rollback、delete を通る。
 
 ### Gate 2: basic MicroVM
 
@@ -379,7 +496,7 @@ route と control-plane state の不一致に設定する。
 本番採用条件は Gate 0–5 の完了。失敗した場合、preview は ECS Fargate/App Runner、stateless API
 は Lambda Functions を代替候補とする。
 
-## 14. Deployment parameters
+## 15. Deployment parameters
 
 環境差分は code ではなく設定で与える。
 
@@ -396,7 +513,7 @@ route と control-plane state の不一致に設定する。
 | cold-start timeout | `120` seconds |
 | resume timeout | `30` seconds |
 
-## 15. Open decisions
+## 16. Open decisions
 
 1. 正式な service/API/CLI 名、base image、network connector ARN は何か。
 2. hook の authentication、payload、deadline、retry/ordering guarantee は何か。
@@ -406,4 +523,5 @@ route と control-plane state の不一致に設定する。
 6. vertical scaling の trigger、停止要否、上限、billing granularity は何か。
 7. Puma/WebSocket connection が suspend/maximum duration と衝突する際の正確な挙動は何か。
 8. Tokyo の account quota と unit economics は許容範囲か。
-
+9. Lambda MicroVMs の CloudFormation/CDK 対応範囲と、custom resource が必要な API はどれか。
+10. image build の stabilization は CloudFormation provider polling と pipeline stage のどちらにするか。

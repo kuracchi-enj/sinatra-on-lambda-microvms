@@ -216,6 +216,30 @@ curl --fail-with-body https://MVM_ENDPOINT/ \
   -H 'X-aws-proxy-auth: TOKEN'
 ```
 
+### 9.1 AWS CDK での管理方針
+
+デプロイと永続インフラは AWS CDK（TypeScript）を唯一の IaC entry point とする。手作業の
+CLI は調査・障害解析に限定し、通常の環境構築手順にはしない。
+
+現時点では Lambda MicroVMs に対応する CDK L2 construct および CloudFormation resource type
+を一次資料で確認できていない。このため、次の優先順位で実装方式を決める。
+
+1. CloudFormation resource type があれば CDK の L1 (`Cfn*`) を使う。
+2. L1 が未生成なら `CfnResource` で正式な CloudFormation type を使う。
+3. CloudFormation 未対応の **永続リソース** に限り、Lambda MicroVMs API を呼ぶ CDK custom
+   resource provider を使用する。create/update/delete、stabilization、rollback、物理 ID を実装する。
+4. `RunMicrovm`、resume、token 発行などの **実行時操作** は CloudFormation/custom resource
+   ではなく control proxy/reconciler が行う。
+
+MicroVM 個体は最大生存時間を持つ ephemeral runtime なので、CDK stack の resource として
+1 台ずつ管理しない。CDK が管理するのは image definition/build pipeline、network connector、
+IAM、routing table、proxy、reconciler、logs/alarms 等の desired infrastructure である。
+
+image build が非同期かつ CloudFormation timeout を超え得る場合、custom resource Lambda 内で
+待ち続けない。CodeBuild/Step Functions 等へ処理を委譲し、provider の `isComplete` polling または
+deployment pipeline の別 stage で完成を待つ。image version/digest を deployment artifact として
+固定し、stack rollback 時にも既存世代を直ちに削除しない。
+
 ## 10. 実装前に一次資料で閉じる項目
 
 | 優先度 | 未確認事項 | 完了条件 |
@@ -226,6 +250,7 @@ curl --fail-with-body https://MVM_ENDPOINT/ \
 | P0 | lifecycle hook contract | path、payload、timeout、retry、順序を contract test 化 |
 | P0 | 最大 duration と suspend 中の算入 | quota/API docs と実測が一致 |
 | P0 | token contract | scope、最大 TTL、rotation、revocation、header 名を実測 |
+| P0 | CDK/CloudFormation coverage | resource type、L1、API custom resource の必要範囲を確定 |
 | P1 | memory/disk/vertical scale | 許容値、状態遷移、課金影響を確認 |
 | P1 | network protocol support | HTTP/2、WS、gRPC、SSE を end-to-end test |
 | P1 | snapshot crypto safety | base image の保証と Ruby/OpenSSL version を記録 |
@@ -237,4 +262,3 @@ curl --fail-with-body https://MVM_ENDPOINT/ \
 Sinatra を動かす方式自体は技術的に妥当である。ただし、サービス固有情報が一次資料で
 独立検証できていない現時点では、本番採用を確定しない。まず SPEC.md の検証ゲートを満たし、
 特に lifecycle hook、8 時間終了、JWE proxy、snapshot 復元を実機で確認する。
-
