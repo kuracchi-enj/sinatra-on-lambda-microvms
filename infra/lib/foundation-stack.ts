@@ -1,4 +1,4 @@
-import { CfnOutput, Duration, RemovalPolicy, Stack, StackProps } from "aws-cdk-lib";
+import { CfnOutput, Duration, Stack, StackProps } from "aws-cdk-lib";
 import { AttributeType, BillingMode, Table, TableEncryption } from "aws-cdk-lib/aws-dynamodb";
 import { Key } from "aws-cdk-lib/aws-kms";
 import { BlockPublicAccess, Bucket, BucketEncryption } from "aws-cdk-lib/aws-s3";
@@ -30,7 +30,7 @@ export class FoundationStack extends Stack {
       billingMode: BillingMode.PAY_PER_REQUEST,
       encryption: TableEncryption.CUSTOMER_MANAGED,
       encryptionKey: key,
-      pointInTimeRecovery: true,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
       deletionProtection: config.production,
       removalPolicy: config.removalPolicy
     });

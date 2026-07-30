@@ -13,6 +13,8 @@ class AppTest < Minitest::Test
   def app = App
 
   def setup
+    ENV.delete("APP_GENERATION")
+    ENV.delete("MICROVM_ID")
     App.settings.lifecycle_mutex.synchronize do
       App.settings.ready = false
       App.settings.processed_events = {}
@@ -44,9 +46,39 @@ class AppTest < Minitest::Test
 
     hook "ready"
     get "/health/ready"
+    assert_equal 503, last_response.status
+
+    hook "run", "eventId" => "run-1"
+    get "/health/ready"
     assert_equal 200, last_response.status
 
     hook "suspend", "eventId" => "suspend-1"
+    get "/health/ready"
+    assert_equal 503, last_response.status
+  end
+
+  def test_run_rejects_a_mismatched_runtime_identity
+    ENV["APP_GENERATION"] = "7"
+    ENV["MICROVM_ID"] = "vm-expected"
+
+    hook "run", "eventId" => "run-wrong", "generation" => 6, "microvmId" => "vm-other"
+
+    assert_equal 409, last_response.status
+    assert_equal "runtime_identity_mismatch", parsed_body["error"]
+    get "/health/ready"
+    assert_equal 503, last_response.status
+  end
+
+  def test_resume_revalidates_runtime_identity
+    ENV["APP_GENERATION"] = "7"
+    ENV["MICROVM_ID"] = "vm-expected"
+    hook "run", "eventId" => "run-1", "generation" => 7, "microvmId" => "vm-expected"
+    assert_equal 200, last_response.status
+
+    hook "suspend", "eventId" => "suspend-1"
+    hook "resume", "eventId" => "resume-wrong", "generation" => 8, "microvmId" => "vm-expected"
+
+    assert_equal 409, last_response.status
     get "/health/ready"
     assert_equal 503, last_response.status
   end

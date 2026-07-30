@@ -56,6 +56,22 @@ class App < Sinatra::Base
       end
       true
     end
+
+    def validate_runtime_identity!(payload)
+      expected_generation = ENV["APP_GENERATION"]
+      expected_microvm_id = ENV["MICROVM_ID"]
+      generation_matches = expected_generation.to_s.empty? || payload["generation"].to_s == expected_generation
+      microvm_matches = expected_microvm_id.to_s.empty? || payload["microvmId"].to_s == expected_microvm_id
+      return if generation_matches && microvm_matches
+
+      settings.ready = false
+      warn JSON.generate(
+        event: "microvm.identity_mismatch",
+        request_id: request_id,
+        generation: payload["generation"]
+      )
+      halt json_response({error: "runtime_identity_mismatch", request_id: request_id}, 409)
+    end
   end
 
   before do
@@ -85,8 +101,9 @@ class App < Sinatra::Base
   end
 
   post "#{HOOK_PREFIX}/ready" do
-    settings.lifecycle_mutex.synchronize { settings.ready = true }
-    json_response(status: "ready")
+    # Listener readiness is distinct from tenant request readiness. The run hook
+    # must establish and validate this VM's runtime identity first.
+    json_response(status: "listener_ready")
   end
 
   post "#{HOOK_PREFIX}/validate" do
@@ -96,6 +113,7 @@ class App < Sinatra::Base
   post "#{HOOK_PREFIX}/run" do
     payload = hook_payload
     processed = perform_event_once(payload) do
+      validate_runtime_identity!(payload)
       settings.ready = true
       warn JSON.generate(event: "microvm.run", microvm_id: payload["microvmId"], generation: payload["generation"])
     end
@@ -110,7 +128,10 @@ class App < Sinatra::Base
 
   post "#{HOOK_PREFIX}/resume" do
     payload = hook_payload
-    processed = perform_event_once(payload) { settings.ready = true }
+    processed = perform_event_once(payload) do
+      validate_runtime_identity!(payload)
+      settings.ready = true
+    end
     json_response(status: "ready", duplicate: !processed)
   end
 
