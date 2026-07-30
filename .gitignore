@@ -1,0 +1,6 @@
+.bundle/
+vendor/bundle/
+infra/cdk.out/
+infra/coverage/
+infra/dist/
+infra/node_modules/
