@@ -10,16 +10,23 @@ import { StringAttribute, UserPool, UserPoolClient } from "aws-cdk-lib/aws-cogni
 import { Table } from "aws-cdk-lib/aws-dynamodb";
 import { Rule, Schedule } from "aws-cdk-lib/aws-events";
 import { LambdaFunction } from "aws-cdk-lib/aws-events-targets";
-import { Architecture, Code, Function, Runtime, Tracing } from "aws-cdk-lib/aws-lambda";
+import { Effect, PolicyStatement, Role } from "aws-cdk-lib/aws-iam";
+import { Architecture, Function, Runtime, Tracing } from "aws-cdk-lib/aws-lambda";
+import { NodejsFunction, OutputFormat } from "aws-cdk-lib/aws-lambda-nodejs";
 import { LogGroup, RetentionDays } from "aws-cdk-lib/aws-logs";
 import { Queue, QueueEncryption } from "aws-cdk-lib/aws-sqs";
 import { CfnWebACL, CfnWebACLAssociation } from "aws-cdk-lib/aws-wafv2";
 import { Construct } from "constructs";
+import * as path from "node:path";
 import { StageConfig } from "./config";
 
 export interface ControlPlaneStackProps extends StackProps {
   readonly config: StageConfig;
   readonly routesTable: Table;
+  readonly microvmImageArn: string;
+  readonly microvmImageVersion: string;
+  readonly microvmExecutionRole: Role;
+  readonly vpcEgressConnectorArn: string;
 }
 
 export class ControlPlaneStack extends Stack {
@@ -36,46 +43,105 @@ export class ControlPlaneStack extends Stack {
       retention,
       removalPolicy: config.removalPolicy
     });
-    this.proxyFunction = new Function(this, "ProxyFunction", {
+    const ingressConnectorArn =
+      `arn:${Aws.PARTITION}:lambda:${Aws.REGION}:aws:network-connector:aws-network-connector:ALL_INGRESS`;
+    const internetEgressConnectorArn =
+      `arn:${Aws.PARTITION}:lambda:${Aws.REGION}:aws:network-connector:aws-network-connector:INTERNET_EGRESS`;
+    const egressConnectorArn = config.egressMode === "vpc"
+      ? props.vpcEgressConnectorArn
+      : internetEgressConnectorArn;
+    const bundling = {
+      minify: false,
+      sourceMap: true,
+      format: OutputFormat.CJS,
+      externalModules: [] as string[]
+    };
+
+    this.proxyFunction = new NodejsFunction(this, "ProxyFunction", {
       architecture: Architecture.ARM_64,
       runtime: Runtime.NODEJS_22_X,
-      handler: "index.handler",
-      code: Code.fromAsset("runtime/proxy"),
+      entry: path.join(__dirname, "../runtime/proxy/index.js"),
+      handler: "handler",
       description: "Authenticated tenant routing proxy for Sinatra MicroVMs",
-      timeout: Duration.seconds(120),
+      timeout: Duration.seconds(28),
       memorySize: 512,
       reservedConcurrentExecutions: config.proxyReservedConcurrency,
       tracing: Tracing.ACTIVE,
       logGroup: proxyLogs,
+      bundling,
       environment: {
         ROUTES_TABLE_NAME: routesTable.tableName,
-        STAGE: config.stage
+        STAGE: config.stage,
+        MICROVM_IMAGE_ARN: props.microvmImageArn,
+        MICROVM_IMAGE_VERSION: props.microvmImageVersion,
+        MICROVM_EXECUTION_ROLE_ARN: props.microvmExecutionRole.roleArn,
+        INGRESS_CONNECTOR_ARN: ingressConnectorArn,
+        EGRESS_CONNECTOR_ARN: egressConnectorArn,
+        MAXIMUM_DURATION_SECONDS: String(config.maximumDurationSeconds),
+        MAX_IDLE_DURATION_SECONDS: String(config.maxIdleDurationSeconds),
+        SUSPENDED_DURATION_SECONDS: String(config.suspendedDurationSeconds),
+        HARD_EXPIRY_MARGIN_SECONDS: String(config.hardExpiryMarginSeconds),
+        TOKEN_TTL_MINUTES: String(config.tokenTtlMinutes),
+        PROVISIONING_WAIT_MILLISECONDS: "10000"
       }
     });
     routesTable.grantReadWriteData(this.proxyFunction);
+    this.proxyFunction.addToRolePolicy(new PolicyStatement({
+      effect: Effect.ALLOW,
+      actions: [
+        "lambda:RunMicrovm",
+        "lambda:GetMicrovm",
+        "lambda:CreateMicrovmAuthToken",
+        "lambda:TerminateMicrovm"
+      ],
+      resources: [
+        props.microvmImageArn,
+        `arn:${Aws.PARTITION}:lambda:${Aws.REGION}:${Aws.ACCOUNT_ID}:microvm:*`
+      ]
+    }));
+    props.microvmExecutionRole.grantPassRole(this.proxyFunction.grantPrincipal);
 
     const reconcilerLogs = new LogGroup(this, "ReconcilerLogs", {
       retention,
       removalPolicy: config.removalPolicy
     });
-    this.reconcilerFunction = new Function(this, "ReconcilerFunction", {
+    this.reconcilerFunction = new NodejsFunction(this, "ReconcilerFunction", {
       architecture: Architecture.ARM_64,
       runtime: Runtime.NODEJS_22_X,
-      handler: "index.handler",
-      code: Code.fromAsset("runtime/reconciler"),
+      entry: path.join(__dirname, "../runtime/reconciler/index.js"),
+      handler: "handler",
       description: "Reconciles expired or stuck Sinatra MicroVM route records",
       timeout: Duration.seconds(60),
       memorySize: 256,
       reservedConcurrentExecutions: config.reconcilerReservedConcurrency,
       tracing: Tracing.ACTIVE,
       logGroup: reconcilerLogs,
+      bundling,
       environment: {
         ROUTES_TABLE_NAME: routesTable.tableName,
         STAGE: config.stage,
+        MICROVM_IMAGE_ARN: props.microvmImageArn,
+        MICROVM_IMAGE_VERSION: props.microvmImageVersion,
+        MICROVM_EXECUTION_ROLE_ARN: props.microvmExecutionRole.roleArn,
+        INGRESS_CONNECTOR_ARN: ingressConnectorArn,
+        EGRESS_CONNECTOR_ARN: egressConnectorArn,
+        MAXIMUM_DURATION_SECONDS: String(config.maximumDurationSeconds),
+        MAX_IDLE_DURATION_SECONDS: String(config.maxIdleDurationSeconds),
+        SUSPENDED_DURATION_SECONDS: String(config.suspendedDurationSeconds),
+        HARD_EXPIRY_MARGIN_SECONDS: String(config.hardExpiryMarginSeconds),
         PROVISIONING_LEASE_GRACE_SECONDS: "60"
       }
     });
     routesTable.grantReadWriteData(this.reconcilerFunction);
+    this.reconcilerFunction.addToRolePolicy(new PolicyStatement({
+      effect: Effect.ALLOW,
+      actions: ["lambda:RunMicrovm", "lambda:GetMicrovm", "lambda:TerminateMicrovm"],
+      resources: [
+        props.microvmImageArn,
+        `arn:${Aws.PARTITION}:lambda:${Aws.REGION}:${Aws.ACCOUNT_ID}:microvm:*`
+      ]
+    }));
+    props.microvmExecutionRole.grantPassRole(this.reconcilerFunction.grantPrincipal);
 
     new Rule(this, "ReconcileSchedule", {
       schedule: Schedule.rate(Duration.minutes(1)),

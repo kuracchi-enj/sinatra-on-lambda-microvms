@@ -3,6 +3,7 @@
 require "json"
 require "securerandom"
 require "sinatra/base"
+require "time"
 
 class App < Sinatra::Base
   HOOK_PREFIX = "/aws/lambda-microvms/runtime/v1"
@@ -13,7 +14,9 @@ class App < Sinatra::Base
     set :raise_errors, false
     set :lifecycle_mutex, Mutex.new
     set :ready, false
-    set :processed_events, {}
+    set :generation, "unassigned"
+    set :microvm_id, nil
+    set :runtime_initialized, false
   end
 
   helpers do
@@ -28,15 +31,6 @@ class App < Sinatra::Base
       @request_id ||= REQUEST_ID_PATTERN.match?(supplied.to_s) ? supplied : SecureRandom.uuid
     end
 
-    def authorized_hook?
-      expected = ENV["LIFECYCLE_HOOK_SECRET"]
-      supplied = request.env["HTTP_X_LIFECYCLE_SECRET"]
-      return false if expected.nil? || expected.empty? || supplied.nil?
-      return false unless expected.bytesize == supplied.bytesize
-
-      Rack::Utils.secure_compare(expected, supplied)
-    end
-
     def hook_payload
       body = request.body.read
       body.empty? ? {} : JSON.parse(body)
@@ -44,33 +38,34 @@ class App < Sinatra::Base
       halt json_response({error: "invalid_json", request_id: request_id}, 400)
     end
 
-    def perform_event_once(payload)
-      event_id = payload["eventId"]
-      halt json_response({error: "event_id_required", request_id: request_id}, 400) if event_id.to_s.empty?
+    def run_configuration(payload)
+      microvm_id = payload["microvmId"].to_s
+      halt json_response({error: "microvm_id_required", request_id: request_id}, 400) if microvm_id.empty?
 
-      settings.lifecycle_mutex.synchronize do
-        return false if settings.processed_events.key?(event_id)
-
-        yield
-        settings.processed_events[event_id] = true
+      raw = payload["runHookPayload"].to_s
+      config = raw.empty? ? {} : JSON.parse(raw)
+      generation = config.fetch("generation", 1)
+      unless generation.is_a?(Integer) && generation.positive?
+        halt json_response({error: "invalid_generation", request_id: request_id}, 400)
       end
-      true
+
+      [microvm_id, generation]
+    rescue JSON::ParserError
+      halt json_response({error: "invalid_run_hook_payload", request_id: request_id}, 400)
     end
 
-    def validate_runtime_identity!(payload)
-      expected_generation = ENV["APP_GENERATION"]
-      expected_microvm_id = ENV["MICROVM_ID"]
-      generation_matches = expected_generation.to_s.empty? || payload["generation"].to_s == expected_generation
-      microvm_matches = expected_microvm_id.to_s.empty? || payload["microvmId"].to_s == expected_microvm_id
-      return if generation_matches && microvm_matches
-
-      settings.ready = false
+    def lifecycle_log(event, outcome: "success")
       warn JSON.generate(
-        event: "microvm.identity_mismatch",
+        timestamp: Time.now.utc.iso8601(3),
+        level: "INFO",
+        service: "sinatra-microvm",
+        event: event,
         request_id: request_id,
-        generation: payload["generation"]
+        microvm_id: settings.microvm_id,
+        generation: settings.generation,
+        lifecycle_state: settings.ready ? "RUNNING" : "NOT_READY",
+        outcome: outcome
       )
-      halt json_response({error: "runtime_identity_mismatch", request_id: request_id}, 409)
     end
   end
 
@@ -79,15 +74,11 @@ class App < Sinatra::Base
     content_type :json
   end
 
-  before "#{HOOK_PREFIX}/*" do
-    halt json_response({error: "not_found", request_id: request_id}, 404) unless authorized_hook?
-  end
-
   get "/" do
     json_response(
       message: "Sinatra on Lambda MicroVMs",
       pid: Process.pid,
-      generation: ENV.fetch("APP_GENERATION", "unknown")
+      generation: settings.lifecycle_mutex.synchronize { settings.generation }
     )
   end
 
@@ -112,33 +103,53 @@ class App < Sinatra::Base
 
   post "#{HOOK_PREFIX}/run" do
     payload = hook_payload
-    processed = perform_event_once(payload) do
-      validate_runtime_identity!(payload)
-      settings.ready = true
-      warn JSON.generate(event: "microvm.run", microvm_id: payload["microvmId"], generation: payload["generation"])
+    microvm_id, generation = run_configuration(payload)
+    duplicate = settings.lifecycle_mutex.synchronize do
+      if settings.runtime_initialized
+        halt json_response({error: "runtime_identity_mismatch", request_id: request_id}, 409) unless
+          settings.microvm_id == microvm_id && settings.generation == generation
+        true
+      else
+        # Runtime-specific values must only be initialized after the image
+        # snapshot has been restored for a concrete MicroVM.
+        settings.microvm_id = microvm_id
+        settings.generation = generation
+        settings.runtime_initialized = true
+        settings.ready = true
+        false
+      end
     end
-    json_response(status: "ok", duplicate: !processed)
+    unless duplicate
+      lifecycle_log("microvm.run")
+    end
+    json_response(status: "ok", duplicate: duplicate)
   end
 
   post "#{HOOK_PREFIX}/suspend" do
-    payload = hook_payload
-    processed = perform_event_once(payload) { settings.ready = false }
-    json_response(status: "suspended", duplicate: !processed)
+    settings.lifecycle_mutex.synchronize { settings.ready = false }
+    lifecycle_log("microvm.suspend")
+    json_response(status: "suspended")
   end
 
   post "#{HOOK_PREFIX}/resume" do
-    payload = hook_payload
-    processed = perform_event_once(payload) do
-      validate_runtime_identity!(payload)
+    initialized = settings.lifecycle_mutex.synchronize do
+      next false unless settings.runtime_initialized
+
+      # Reconnect external pools and refresh short-lived credentials here as
+      # those dependencies are added. No external connection is held today.
       settings.ready = true
+      true
     end
-    json_response(status: "ready", duplicate: !processed)
+    halt json_response({error: "runtime_not_initialized", request_id: request_id}, 503) unless initialized
+
+    lifecycle_log("microvm.resume")
+    json_response(status: "ready")
   end
 
   post "#{HOOK_PREFIX}/terminate" do
-    payload = hook_payload
-    processed = perform_event_once(payload) { settings.ready = false }
-    json_response(status: "terminated", duplicate: !processed)
+    settings.lifecycle_mutex.synchronize { settings.ready = false }
+    lifecycle_log("microvm.terminate")
+    json_response(status: "terminated")
   end
 
   not_found do

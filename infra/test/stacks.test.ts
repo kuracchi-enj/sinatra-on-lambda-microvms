@@ -14,7 +14,15 @@ function config(stage: "dev" | "production"): StageConfig {
     removalPolicy: production ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
     logRetentionDays: production ? 365 : 30,
     proxyReservedConcurrency: production ? 100 : 10,
-    reconcilerReservedConcurrency: 1
+    reconcilerReservedConcurrency: 1,
+    microvmBaseImageVersion: "0",
+    microvmMemoryMiB: 512,
+    maximumDurationSeconds: 3600,
+    maxIdleDurationSeconds: 300,
+    suspendedDurationSeconds: 1800,
+    hardExpiryMarginSeconds: 600,
+    tokenTtlMinutes: 5,
+    egressMode: "internet"
   };
 }
 
@@ -27,11 +35,18 @@ function stacks(stage: "dev" | "production" = "dev"): {
   const app = new App();
   const stageConfig = config(stage);
   const foundation = new FoundationStack(app, "Foundation", { config: stageConfig });
+  const image = new MicrovmImageStack(app, "Image", {
+    config: stageConfig,
+    vpcEgressConnectorArn: foundation.vpcEgressConnectorArn
+  });
   const control = new ControlPlaneStack(app, "Control", {
     config: stageConfig,
-    routesTable: foundation.routesTable
+    routesTable: foundation.routesTable,
+    microvmImageArn: image.imageArn,
+    microvmImageVersion: image.imageVersion,
+    microvmExecutionRole: image.executionRole,
+    vpcEgressConnectorArn: foundation.vpcEgressConnectorArn
   });
-  const image = new MicrovmImageStack(app, "Image", { config: stageConfig });
   const observability = new ObservabilityStack(app, "Observability", {
     config: stageConfig,
     routesTable: foundation.routesTable,
@@ -71,6 +86,15 @@ test("foundation encrypts and protects durable resources", () => {
         Condition: { Bool: { "aws:SecureTransport": "false" } }
       })])
     })
+  });
+  template.resourceCountIs("AWS::EC2::VPC", 1);
+  template.hasResourceProperties("AWS::Lambda::NetworkConnector", {
+    Configuration: {
+      VpcEgressConfiguration: Match.objectLike({
+        AssociatedComputeResourceTypes: ["MicroVm"],
+        NetworkProtocol: "IPv4"
+      })
+    }
   });
 });
 
@@ -116,8 +140,23 @@ test("image stack publishes a content-addressed source asset without an invented
   const template = Template.fromStack(stacks().image);
   template.resourceCountIs("Custom::AWS", 0);
   template.hasOutput("ApplicationSourceHash", {});
-  template.hasOutput("MicrovmProviderStatus", {
-    Value: "BLOCKED_UNTIL_OFFICIAL_CLOUDFORMATION_OR_SDK_MODEL_IS_VERIFIED"
+  template.hasResourceProperties("AWS::Lambda::MicrovmImage", {
+    BaseImageVersion: "0",
+    CpuConfigurations: [{ Architecture: "ARM_64" }],
+    AdditionalOsCapabilities: [],
+    EgressNetworkConnectors: [
+      { "Fn::Join": Match.anyValue() }
+    ],
+    Resources: [{ MinimumMemoryInMiB: 512 }],
+    Hooks: Match.objectLike({
+      Port: 8080,
+      MicrovmHooks: Match.objectLike({
+        Run: "ENABLED",
+        Suspend: "ENABLED",
+        Resume: "ENABLED",
+        Terminate: "ENABLED"
+      })
+    })
   });
 });
 

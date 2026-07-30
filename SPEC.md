@@ -1,7 +1,7 @@
 # Sinatra on AWS Lambda MicroVMs 仕様設計
 
 最終更新: 2026-07-30 (UTC)  
-状態: Draft / 実機検証前
+状態: Core PoC implemented / AWS account end-to-end deploy 前
 
 ## 1. 目的
 
@@ -10,8 +10,8 @@
 公開せず、最大生存時間を越えても外部永続状態から安全に再作成できるようにする。
 
 本仕様は短命な preview/workspace を対象とする。一般公開の常時稼働 Web site を 1 台の VM
-で提供することは対象外。MicroVMs 固有値は SEARCH.md の調査ステータスに従い、P0 の
-一次資料・実機検証が済むまで provisional とする。
+で提供することは対象外。service/API/CloudFormation/CDK contract は 2026-07-30 時点の AWS
+一次資料で確認済み。account quota と deploy/runtime 動作は実機検証前。
 
 ## 2. 要求
 
@@ -22,8 +22,9 @@
 * VM がない場合は 1 台だけ作成し、起動完了後に転送する。
 * suspended VM への request は auto-resume または明示 resume 後に転送する。
 * idle 時に suspend し、最大 duration 前に新 VM へ世代交代する。
-* lifecycle hook で connection 解放・再接続と checkpoint を行う。
-* terminate 後も必要な tenant data は外部 store から復元できる。
+* lifecycle hook で connection 解放・再接続と checkpoint を行う。現行のstateless demoでは
+  外部connectionがないため、readiness遷移以外はno-opとする。
+* durable tenant dataを追加する場合、terminate後も外部storeから復元できること。
 
 ### 2.2 非機能要求
 
@@ -59,11 +60,8 @@ flowchart TB
     Proxy -->|JWE header| VM[Sinatra + Puma / arm64 MicroVM]
     Recon[Reconciler / Scheduler] --> Store
     Recon --> CP
-    Events[SQS/S3/EventBridge] --> Launcher[Lambda launcher]
-    Launcher --> CP
-    Launcher --> Store
-    VM --> Secrets[Secrets Manager]
-    VM --> DB[(RDS / external state)]
+    VM -. optional .-> Secrets[Secrets Manager]
+    VM -. optional .-> DB[(RDS / external state)]
     VM --> Logs[Logs / Metrics / Traces]
 ```
 
@@ -75,9 +73,8 @@ flowchart TB
 | Proxy | user auth、tenant resolution、token mint/cache、request forwarding |
 | Routing store | desired/observed state、generation、lease、endpoint metadata |
 | Reconciler | orphan cleanup、duration 前の rotation、failed transition recovery |
-| Launcher | AWS event を必要なら VM control action へ変換 |
 | Sinatra VM | tenant workload と lifecycle hook |
-| External state | durable data、secret、artifact、checkpoint |
+| External state | durable data追加時のsecret、artifact、checkpoint。現行demoでは未使用 |
 
 ## 5. Routing data model
 
@@ -106,7 +103,8 @@ endpoint と token を client response、access log、trace attribute に含め�
 1. Edge が request ID を付与し、proxy が user を認証する。
 2. proxy は user claim から tenant ID を決定する。client 指定値を信用しない。
 3. route が `RUNNING` なら短期 JWE を取得/cache し VM へ転送する。
-4. route が `SUSPENDED` なら resume を開始し、同じ generation が `RUNNING` になるまで待つ。
+4. route が `SUSPENDED` なら auto-resume を有効にした endpoint へ転送する。Lambda は
+   `/resume` 完了まで最初の request を保持する。
 5. route がない/期限切れなら conditional write で lease を 1 caller だけが取得し起動する。
 6. 他 caller は bounded backoff で route を監視し、重複 VM を作らない。
 7. upstream の 401/403 は token を 1 回だけ更新して retry する。
@@ -114,7 +112,8 @@ endpoint と token を client response、access log、trace attribute に含め�
 9. hard expiry safety margin 内なら新 generation を作り、旧 VM を drain 後 terminate する。
 
 Provisioning 中は `202 Retry-After` または同期 wait を API ごとに選べるようにする。初期 demo は
-最大 120 秒同期 wait とし、timeout 時は `503` と request ID を返す。
+API Gateway の integration window 内で最大 10 秒待ち、未完了なら `202 Retry-After: 2` と
+request ID を返す。
 
 ## 7. Sinatra application contract
 
@@ -137,19 +136,21 @@ draining/suspending 中の readiness は `503`。
 
 ### 7.2 lifecycle hook
 
-暫定 prefix は `/aws/lambda-microvms/runtime/v1`。正確な contract は P0 検証で固定する。
+prefix は `/aws/lambda-microvms/runtime/v1`。hook は image の `Hooks` で `ENABLED` にし、
+port 8080 を指定する。
 
 | Hook | Required behavior | Idempotency |
 | --- | --- | --- |
 | `ready` | boot 完了と listener 準備を返す | 何度でも 200 |
 | `validate` | app/config が snapshot 可であることを返す | read-only |
-| `run` | VM identity、generation、secret を実行時取得 | event ID で重複抑止 |
+| `run` | service supplied `microvmId` と `runHookPayload` から generation を初期化 | 同じ identity の再呼出し可 |
 | `suspend` | readiness off、request drain、flush、DB pool disconnect | 再呼出し可 |
 | `resume` | PRNG/identity 確認、credential 更新、DB pool reconnect、readiness on | 再呼出し可 |
 | `terminate` | readiness off、best-effort checkpoint、connection close | 再呼出し可 |
 
-hook handler は共有 secret/network identity で application route から保護する。公式側で hook が
-内部経路に限定されない場合、外部から呼べない ingress rule または signature validation を必須とする。
+public proxy は hook prefix を転送せず常に `404` にする。MicroVM endpoint と port-scoped JWE は
+proxy のみが保持し、browser/client には渡さない。AWS が送らない独自 header を hook に要求して
+lifecycle call を妨げてはならない。
 
 terminate hook は delivery や完了を保証されると仮定しない。durable update は request transaction
 または定期 checkpoint で行う。
@@ -187,7 +188,12 @@ class App < Sinatra::Base
 
   post "#{HOOK_PREFIX}/run" do
     payload = JSON.parse(request.body.read)
-    warn({ event: "microvm.run", microvm_id: payload["microvmId"] }.to_json)
+    config = JSON.parse(payload.fetch("runHookPayload", "{}"))
+    warn({
+      event: "microvm.run",
+      microvm_id: payload["microvmId"],
+      generation: config["generation"]
+    }.to_json)
     status 200
   end
 
@@ -228,9 +234,9 @@ run App
 lockfile は `aarch64-linux` platform を含め、全 dependency を pin する。CI では immutable image
 digest、SBOM、vulnerability scan 結果を release artifact に保存する。
 
-### 8.2 provisional Dockerfile
+### 8.2 Dockerfile
 
-base image 名と Ruby 3.4 package 名は実際の repository で検証してから固定する。
+公式 base container image と AL2023 Ruby 3.4 package を使用する。
 
 ```dockerfile
 FROM public.ecr.aws/lambda/microvms:al2023-minimal
@@ -285,9 +291,11 @@ WebSocket/SSE は初期 version では suspend 前に server close し、client 
 
 ### 9.4 rotation / terminate
 
-hard expiry の 10 分前（計測後調整）に新 generation を provision する。ready 後に routing row を
-conditional swap し、旧 VM を draining にする。最大 30 秒後に terminate する。切替失敗時は旧 VM
-の安全時間内だけ rollback できるが、最大 duration を延長できるとは仮定しない。
+hard expiry の 10 分前（計測後調整）にreconcilerがconditional leaseを取得し、新generationを
+provisionする。現行PoCはrouting rowを`PROVISIONING`へ切り替え、旧VM IDを
+`draining_microvm_id`として保持する。新VMがreadyになるまでclientには`202 Retry-After`を返し、
+ready確認後に旧VMをterminateする。完全無停止が必要なproductionではactive/pending generationを
+二重保持し、ready後にconditional swapする。切替失敗時も最大durationを延長できるとは仮定しない。
 
 ## 10. Security
 
@@ -312,7 +320,7 @@ conditional swap し、旧 VM を draining にする。最大 30 秒後に termi
 | resume failure | route を `FAILED`、新 generation を起動。旧 local state は信用しない |
 | proxy timeout | client に request ID と 503。background reconciliation 継続 |
 | DB unavailable | readiness 503、bounded exponential backoff、credential を log しない |
-| hook duplicate | event ID/state machine で idempotent response |
+| hook duplicate | runtime identity と lifecycle state で idempotent response |
 | hook missing | periodic checkpoint と control-plane watcher で回復 |
 | forced 8-hour termination | safety-margin rotation。外部状態から再作成 |
 | region/service outage | 初期 version は fail closed。multi-region は将来仕様 |
@@ -371,7 +379,7 @@ infra/
 | Stack | CDK managed resources | Lifecycle |
 | --- | --- | --- |
 | `FoundationStack` | VPC/subnets、security groups、KMS、artifact bucket、routing table | 長期、retain 優先 |
-| `ControlPlaneStack` | public API/proxy、WAF、reconciler、IAM、event launcher | application release 単位 |
+| `ControlPlaneStack` | public API/proxy、WAF、reconciler、IAM | application release 単位 |
 | `MicrovmImageStack` | source asset、build role/pipeline、image definition/version output | immutable 世代単位 |
 | `ObservabilityStack` | log groups、dashboards、alarms、notification topic | 長期 |
 
@@ -381,15 +389,17 @@ protection を設定する。ephemeral preview stage のみ `DESTROY` を許可�
 
 ### 13.3 MicroVM resource coverage
 
-実装時点の対応状況を次の順で検出する。
+Lambda MicroVMs は `AWS::Lambda::MicrovmImage` と `AWS::Lambda::NetworkConnector`、
+CDK L1 `CfnMicrovmImage` / `CfnNetworkConnector` を提供している。本実装は L1 を使用する。
+将来の resource coverage 変更時は次の優先順位で実装方式を決める。
 
-1. AWS CDK に正式な L2 construct があれば採用する。
-2. CloudFormation type に対応する L1 `Cfn*` があれば採用する。
-3. L1 未生成で正式な CloudFormation type があれば `CfnResource` を使用する。
+1. AWS CDK に正式な安定 L2 construct があれば採用を検討する。
+2. 現状どおり CloudFormation type に対応する L1 `Cfn*` を使用する。
+3. L1 未生成の新 resource で正式な CloudFormation type があれば `CfnResource` を使用する。
 4. CloudFormation 未対応の永続 resource だけを CDK custom resource provider で補う。
 
-custom resource は `AwsCustomResource` に任意の SDK call 名を推測して埋め込まない。正式な SDK
-service model が提供されるまでは synth を失敗させる。専用 provider は以下を満たすこと。
+custom resource は `AwsCustomResource` に任意の SDK call 名を推測して埋め込まない。専用 provider
+が将来必要になった場合は以下を満たすこと。
 
 * create/update/delete が同一入力に対して冪等である。
 * AWS resource ID を CloudFormation physical resource ID にする。
@@ -456,16 +466,16 @@ CDK assertion tests で次を固定する。
 
 ### Gate 0: service discovery
 
-* 東京リージョンで service/API/ARN/quotas/pricing を一次資料と CLI で確認する。
-* hook/token schema を保存し、この文書の provisional 表記を解消する。
-* CloudFormation resource type、CDK L1/L2、SDK service model の対応範囲を記録する。
+* 完了: 東京を含む提供 region、service/API/ARN、hook/token schema を AWS 一次資料で確認。
+* 完了: CloudFormation resource type、CDK L1、JavaScript SDK service model を確認し実装。
+* 未完了: deploy 対象 account の quota、managed base image version、料金 ceiling を CLI で確認。
 
 ### Gate 1: image
 
-* `linux/arm64` image が build され、x86_64-only dependency がない。
-* non-root Puma が port 8080 で起動し、local container test が通る。
-* image layer、environment、SBOM に secret がない。
-* CDK image resource/provider が create、no-op update、replacement、rollback、delete を通る。
+* 完了: `linux/arm64` image が build され、x86_64-only dependency がない。
+* 完了: non-root Puma が port 8080 で起動し、local container/unit test が通る。
+* 一部完了: source/environmentにsecretがない。SBOM生成とimage vulnerability scanは未完了。
+* 未完了: CDK image resourceがAWS上でcreate、no-op update、replacement、rollback、deleteを通る。
 
 ### Gate 2: basic MicroVM
 
@@ -515,13 +525,11 @@ CDK assertion tests で次を固定する。
 
 ## 16. Open decisions
 
-1. 正式な service/API/CLI 名、base image、network connector ARN は何か。
-2. hook の authentication、payload、deadline、retry/ordering guarantee は何か。
-3. auto-resume request は待機・queue・error のどれになるか。
-4. token の最小/最大 TTL、revocation、connection upgrade 時の検証挙動は何か。
-5. snapshot disk の crash consistency と encryption/key ownership は何か。
-6. vertical scaling の trigger、停止要否、上限、billing granularity は何か。
-7. Puma/WebSocket connection が suspend/maximum duration と衝突する際の正確な挙動は何か。
-8. Tokyo の account quota と unit economics は許容範囲か。
-9. Lambda MicroVMs の CloudFormation/CDK 対応範囲と、custom resource が必要な API はどれか。
-10. image build の stabilization は CloudFormation provider polling と pipeline stage のどちらにするか。
+1. token revocation と connection upgrade 時の詳細な検証挙動は何か。
+2. snapshot disk の crash consistency と encryption/key ownership は何か。
+3. vertical scaling の trigger と billing granularity は用途に対して妥当か。
+4. Puma/WebSocket connection が suspend/maximum duration と衝突する際の運用値は何か。
+5. Tokyo の対象 account quota と unit economics は許容範囲か。
+6. API Gateway で `202 Retry-After` を返す provisioning UX を同期 wait に変更する必要があるか。
+7. production rotation を無停止にするため routing row を active/pending generation の二重表現へ
+   拡張するか。

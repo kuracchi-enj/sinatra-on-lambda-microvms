@@ -4,20 +4,23 @@
 
 ## 0. 調査結果の扱い
 
-本書は、依頼時に提示された情報を出発点に、既存の AWS Lambda、Firecracker、
-Amazon Linux 2023 (AL2023)、Ruby/Sinatra の公開仕様と突き合わせた設計前調査である。
+本書は AWS Lambda MicroVMs、CloudFormation、AWS CDK、SDK、AL2023、Ruby/Sinatra の
+公開一次資料を 2026-07-30 に再確認した調査記録である。
 
-> **重要な検証ステータス**
+> **検証ステータス**
 >
-> この作業環境から AWS の Web 検索および AWS CLI/API に接続できなかったため、
-> 「Lambda MicroVMs が 2026-06-22 に GA」「東京リージョン対応」、サービス固有の
-> API 名、ARN、上限、料金、ベースイメージ名は一次資料で独立に再確認できていない。
-> したがって、以下では依頼時情報を **候補仕様** として整理し、実装開始前に確認すべき
-> 項目を明示する。未検証の値を本番契約として扱ってはならない。
+> Lambda MicroVMs の 2026-06-22 提供開始、東京リージョン対応、service API、hook/JWE schema、
+> CloudFormation resource、CDK L1、JavaScript SDK は AWS 一次資料で確認済み。
+> 対象 AWS account の quota、managed base image の現在 version、料金 ceiling、実機 deploy は未確認。
 
 既存サービスについて参照した一次資料:
 
 * [AWS Lambda quotas](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html)
+* [AWS Lambda MicroVMs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-microvms-guide.html)
+* [Running and using MicroVMs](https://docs.aws.amazon.com/lambda/latest/dg/microvms-launching.html)
+* [MicroVM images](https://docs.aws.amazon.com/lambda/latest/dg/microvms-images.html)
+* [AWS::Lambda::MicrovmImage](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-lambda-microvmimage.html)
+* [AWS::Lambda::NetworkConnector](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-lambda-networkconnector.html)
 * [AWS Lambda container images](https://docs.aws.amazon.com/lambda/latest/dg/images-create.html)
 * [AWS Lambda execution environment](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtime-environment.html)
 * [Firecracker](https://firecracker-microvm.github.io/)
@@ -27,7 +30,7 @@ Amazon Linux 2023 (AL2023)、Ruby/Sinatra の公開仕様と突き合わせた�
 
 ## 1. 要約
 
-依頼時情報によれば、Lambda MicroVMs は従来 Lambda Functions の上位プランではなく、
+Lambda MicroVMs は従来 Lambda Functions の上位プランではなく、
 Lambda ブランドに加わった別のコンピュートモデルである。Functions がイベント単位で
 ハンドラーを呼ぶのに対し、MicroVMs は利用者が API から MicroVM を作成、停止、再開、
 破棄し、その中で通常の Linux アプリケーションプロセスを動かす。
@@ -40,9 +43,9 @@ Sinatra と Puma は ARM64 Linux 上で通常の HTTP サーバーとして動�
 
 ## 2. 従来 Lambda Functions との比較
 
-以下の MicroVMs 列は依頼時情報に基づくため、正式なサービスドキュメントで要再確認。
+以下の MicroVMs 列は AWS 公式 developer guide/API reference で確認済み。
 
-| 項目 | Lambda Functions | Lambda MicroVMs（候補仕様） |
+| 項目 | Lambda Functions | Lambda MicroVMs |
 | --- | --- | --- |
 | 実行モデル | イベントをハンドラーへ渡す | Linux 上で通常の常駐プロセスを起動 |
 | 主用途 | API、イベント処理、短時間バッチ | サンドボックス、開発環境、テナント別環境、CI/CD |
@@ -64,7 +67,7 @@ Sinatra と Puma は ARM64 Linux 上で通常の HTTP サーバーとして動�
 
 ## 3. ライフサイクル
 
-候補となる状態遷移は次の通り。
+正式な runtime 状態遷移は次の通り。
 
 ```mermaid
 stateDiagram-v2
@@ -78,9 +81,10 @@ stateDiagram-v2
     Terminated --> [*]
 ```
 
-アプリケーションには `/ready`、`/validate`、`/run`、`/suspend`、`/resume`、
-`/terminate` のライフサイクルフックが通知されるという前提を置く。ただし、正確な URL、
-HTTP method、payload schema、timeout、retry、失敗時動作、呼び出し順は **未検証** である。
+アプリケーションには prefix `/aws/lambda-microvms/runtime/v1` の `/ready`、`/validate`、
+`/run`、`/suspend`、`/resume`、`/terminate` が HTTP POST される。`run` body は service supplied
+`microvmId` と、`RunMicrovm` に渡した `runHookPayload` を含む。runtime hook timeout は 1–60 秒、
+image build hook timeout は 1–3600 秒。
 
 最大 8 時間はサスペンドしても延長されない。永続化すべき状態は RDS、DynamoDB、S3 等へ
 書き出し、新しい VM が再構成できることが必須となる。
@@ -178,13 +182,13 @@ single worker / 複数 thread とし、`preload_app!` や worker fork は採用�
 | 一般公開の常時稼働 Web | 原則 ECS/App Runner 等 | 8 時間上限、token proxy、routing が過剰 |
 | GPU/x86 専用処理 | 不適 | arm64 のみ、専用 hardware なし |
 
-## 9. 東京リージョンでの検証候補手順
+## 9. 東京リージョンでの検証手順
 
-以下は依頼時に提示された **仮の CLI syntax** を再現したもの。CLI service prefix、引数名、
-base image ARN、connector ARN は `aws <service> help` と公式 API reference で置換してから実行する。
+以下の CLI service prefix、API parameter、managed connector ARN は AWS 公式 guide で確認済み。
+実行前に最新 AWS CLI と対象 account の managed base image version/quota を確認する。
 
 ```bash
-zip -r sinatra-microvm.zip Dockerfile Gemfile app.rb config.ru
+zip -r sinatra-microvm.zip Dockerfile Gemfile Gemfile.lock app.rb config.ru
 aws s3 cp sinatra-microvm.zip s3://YOUR_BUCKET/sinatra-microvm.zip \
   --region ap-northeast-1
 
@@ -221,10 +225,10 @@ curl --fail-with-body https://MVM_ENDPOINT/ \
 デプロイと永続インフラは AWS CDK（TypeScript）を唯一の IaC entry point とする。手作業の
 CLI は調査・障害解析に限定し、通常の環境構築手順にはしない。
 
-現時点では Lambda MicroVMs に対応する CDK L2 construct および CloudFormation resource type
-を一次資料で確認できていない。このため、次の優先順位で実装方式を決める。
+CloudFormation は `AWS::Lambda::MicrovmImage` と `AWS::Lambda::NetworkConnector` を提供し、
+AWS CDK 2.261.0 以降には対応 L1 がある。本 repository は CDK 2.262.2 の L1 を使う。
 
-1. CloudFormation resource type があれば CDK の L1 (`Cfn*`) を使う。
+1. `CfnMicrovmImage` と `CfnNetworkConnector` を使う。
 2. L1 が未生成なら `CfnResource` で正式な CloudFormation type を使う。
 3. CloudFormation 未対応の **永続リソース** に限り、Lambda MicroVMs API を呼ぶ CDK custom
    resource provider を使用する。create/update/delete、stabilization、rollback、物理 ID を実装する。
@@ -240,17 +244,17 @@ image build が非同期かつ CloudFormation timeout を超え得る場合、cu
 deployment pipeline の別 stage で完成を待つ。image version/digest を deployment artifact として
 固定し、stack rollback 時にも既存世代を直ちに削除しない。
 
-## 10. 実装前に一次資料で閉じる項目
+## 10. 検証項目
 
 | 優先度 | 未確認事項 | 完了条件 |
 | --- | --- | --- |
-| P0 | GA 日、`ap-northeast-1` availability | AWS announcement と region table の URL を記録 |
-| P0 | CLI/API service name と全 schema | 最新 AWS CLI で help を保存し dry-run 相当まで成功 |
-| P0 | image/connector ARN | account 上で describe/list し、hard-code を排除 |
-| P0 | lifecycle hook contract | path、payload、timeout、retry、順序を contract test 化 |
-| P0 | 最大 duration と suspend 中の算入 | quota/API docs と実測が一致 |
-| P0 | token contract | scope、最大 TTL、rotation、revocation、header 名を実測 |
-| P0 | CDK/CloudFormation coverage | resource type、L1、API custom resource の必要範囲を確定 |
+| Done | GA 日、`ap-northeast-1` availability | AWS announcement と developer guide で確認 |
+| Done | CLI/API service name と schema | AWS API/CLI reference で確認 |
+| Pending | image/connector ARN/version | account 上で describe/list し context 値を確認 |
+| Done | lifecycle hook contract | path、payload、timeout を application/CDK test 化 |
+| Done | 最大 duration と suspend 中の算入 | API docs で 1–28,800 秒を確認 |
+| Partial | token contract | port scope、1–60 分、header を確認。revocation は実測待ち |
+| Done | CDK/CloudFormation coverage | L1 resource を実装し synth/test 成功 |
 | P1 | memory/disk/vertical scale | 許容値、状態遷移、課金影響を確認 |
 | P1 | network protocol support | HTTP/2、WS、gRPC、SSE を end-to-end test |
 | P1 | snapshot crypto safety | base image の保証と Ruby/OpenSSL version を記録 |
@@ -259,6 +263,6 @@ deployment pipeline の別 stage で完成を待つ。image version/digest を d
 
 ## 11. 結論
 
-Sinatra を動かす方式自体は技術的に妥当である。ただし、サービス固有情報が一次資料で
-独立検証できていない現時点では、本番採用を確定しない。まず SPEC.md の検証ゲートを満たし、
-特に lifecycle hook、8 時間終了、JWE proxy、snapshot 復元を実機で確認する。
+Sinatra を動かす方式と AWS CDK/SDK による構成は一次資料およびローカル synth/image build で
+技術的に妥当と確認できた。ただし本番採用には、対象 account への deploy、lifecycle hook、
+maximum duration、JWE proxy、snapshot 復元、quota/cost を SPEC.md の Gate 2–5 で実測する。

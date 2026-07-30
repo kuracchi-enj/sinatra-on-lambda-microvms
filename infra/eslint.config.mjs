@@ -9,11 +9,19 @@ export default tseslint.config(
     files: ["**/*.js"],
     languageOptions: {
       globals: {
+        AbortSignal: "readonly",
+        Buffer: "readonly",
+        URL: "readonly",
         console: "readonly",
         exports: "writable",
+        fetch: "readonly",
+        expect: "readonly",
+        jest: "readonly",
         module: "writable",
         process: "readonly",
-        require: "readonly"
+        require: "readonly",
+        setTimeout: "readonly",
+        test: "readonly"
       }
     },
     rules: {
